@@ -256,6 +256,8 @@ Se quiser, posso:
 🔹 Criar pipeline CI/CD para esse ambiente
 
 
+---
+
 # PARTE 2
 ÓTIMO — vou montar agora um ambiente COMPLETO 100% PRODUÇÃO, unindo:
 ✅ HTTPS com Let’s Encrypt
