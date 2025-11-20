@@ -491,3 +491,287 @@ Quer que eu:
 ✔ Configure para usar múltiplos domínios?
 ✔ Monte uma versão com deploy automático em VPS (Ubuntu)?
 O que você prefere como próximo passo?
+
+
+# Versão 3
+✅ 1. docker-compose.yml
+version: '3.9'
+
+services:
+
+  nginx:
+    image: nginx:stable
+    container_name: nginx_secure
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/modsecurity.conf:/etc/nginx/modsec/modsecurity.conf:ro
+      - ./nginx/crs-setup.conf:/etc/nginx/modsec/crs/crs-setup.conf:ro
+      - ./nginx/logrotate.conf:/etc/logrotate.d/nginx:ro
+      - ./nginx/letsencrypt:/etc/letsencrypt:ro
+      - ./nginx/www:/var/www/certbot:ro
+      - /var/log/nginx:/var/log/nginx
+    depends_on:
+      - php
+      - db
+    networks:
+      - internal
+
+  certbot:
+    image: certbot/certbot
+    container_name: certbot_le
+    volumes:
+      - ./nginx/letsencrypt:/etc/letsencrypt
+      - ./nginx/www:/var/www/certbot
+    command: >
+      certonly --webroot --webroot-path=/var/www/certbot
+      --email ${LETSENCRYPT_EMAIL}
+      --agree-tos --no-eff-email
+      -d ${DOMAIN}
+    networks:
+      - internal
+
+  php:
+    build: ./php
+    container_name: php_fpm
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - ./php:/var/www/html
+    networks:
+      - internal
+
+  db:
+    image: mysql:8.0
+    container_name: mysql_tls
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+    volumes:
+      - ./mysql:/docker-entrypoint-initdb.d
+      - ./mysql/server-cert.pem:/etc/mysql/ssl/server-cert.pem
+      - ./mysql/server-key.pem:/etc/mysql/ssl/server-key.pem
+      - ./mysql/ca.pem:/etc/mysql/ssl/ca.pem
+    command: >
+      --require_secure_transport=ON
+      --ssl-ca=/etc/mysql/ssl/ca.pem
+      --ssl-cert=/etc/mysql/ssl/server-cert.pem
+      --ssl-key=/etc/mysql/ssl/server-key.pem
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+
+  loki:
+    image: grafana/loki:2.9.0
+    ports:
+      - "3100:3100"
+    networks:
+      - internal
+
+  promtail:
+    image: grafana/promtail:2.9.0
+    volumes:
+      - ./promtail/config.yml:/etc/promtail/config.yml
+      - /var/log/nginx:/var/log/nginx
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
+
+✅ 2. .env
+DOMAIN=seudominio.com
+LETSENCRYPT_EMAIL=you@example.com
+
+MYSQL_ROOT_PASSWORD=superSenha123
+MYSQL_DATABASE=appdb
+
+✅ 3. nginx/nginx.conf
+load_module modules/ngx_http_modsecurity_module.so;
+
+user nginx;
+worker_processes auto;
+
+events { worker_connections 1024; }
+
+http {
+    include       mime.types;
+    default_type  application/octet-stream;
+
+    # Segurança e performance
+    server_tokens off;
+    client_max_body_size 10m;
+
+    # Rate limit
+    limit_req_zone $binary_remote_addr zone=req_limit:10m rate=5r/s;
+
+    # ModSecurity WAF
+    modsecurity on;
+    modsecurity_rules_file /etc/nginx/modsec/modsecurity.conf;
+
+    # HTTPS
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+
+    server {
+        listen 80;
+        server_name _;
+        location /.well-known/acme-challenge/ {
+            root /var/www/certbot;
+        }
+        return 301 https://$host$request_uri;
+    }
+
+    server {
+        listen 443 ssl http2;
+        server_name _;
+
+        ssl_certificate     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+        ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+
+        location / {
+            limit_req zone=req_limit burst=20 nodelay;
+            try_files $uri $uri/ /index.php?$query_string;
+        }
+
+        location ~ \.php$ {
+            include fastcgi_params;
+            fastcgi_pass php:9000;
+            fastcgi_param SCRIPT_FILENAME /var/www/html$fastcgi_script_name;
+        }
+    }
+}
+
+✅ 4. nginx/modsecurity.conf
+
+Configuração forte + OWASP CRS:
+
+SecRuleEngine On
+SecRequestBodyAccess On
+SecResponseBodyAccess Off
+
+Include /etc/nginx/modsec/crs/crs-setup.conf
+Include /etc/nginx/modsec/crs/rules/*.conf
+
+✅ 5. nginx/crs-setup.conf
+# OWASP CRS recommended settings
+SecDefaultAction "phase:1,log,auditlog,deny,status:403"
+SecDefaultAction "phase:2,log,auditlog,deny,status:403"
+
+SecAction \
+ "id:900000,\
+  phase:1,\
+  nolog,\
+  pass,\
+  t:none,\
+  setvar:tx.paranoia_level=1"
+
+✅ 6. nginx/logrotate.conf
+/var/log/nginx/*.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    sharedscripts
+    postrotate
+        [ -f /var/run/nginx.pid ] && kill -USR1 `cat /var/run/nginx.pid`
+    endscript
+}
+
+✅ 7. php/Dockerfile
+FROM php:8.2-fpm
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Healthcheck
+COPY php-fpm-healthcheck /usr/local/bin/php-fpm-healthcheck
+RUN chmod +x /usr/local/bin/php-fpm-healthcheck
+
+WORKDIR /var/www/html
+
+HEALTHCHECK --interval=10s --timeout=3s CMD php-fpm-healthcheck || exit 1
+
+✅ 8. php/php-fpm-healthcheck
+#!/bin/sh
+if php-fpm -t 2>&1 | grep -q "\[ERROR\]"; then
+    exit 1
+fi
+exit 0
+
+✅ 9. php/index.php
+<?php
+echo "Aplicação rodando com segurança total! 🔐";
+
+✅ 10. mysql/init.sql
+CREATE TABLE users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    email VARCHAR(150) UNIQUE NOT NULL,
+    password VARCHAR(255) NOT NULL
+);
+
+✅ 11. promtail/config.yml
+server:
+  http_listen_port: 9080
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: nginx
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: nginx
+          __path__: /var/log/nginx/*.log
+
+✅ 12. .github/workflows/ci.yml
+name: Build and Deploy
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Build Docker images
+      run: docker compose build
+
+    - name: Security Scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: php_fpm
+
+    - name: Deploy
+      run: ssh -o StrictHostKeyChecking=no user@server "cd /infra && git pull && docker compose up -d --build"
+
+🎉 Tudo pronto! Arquitetura completa gerada.
+
+Se quiser, posso gerar também:
+
+✅ Versão compatível com Kubernetes
+✅ Versão com Traefik
+✅ Criar script de instalação automática
+✅ Criar backup automático MySQL + Loki
+✅ Criar hardening extra (sysctl, ufw, kernel)
